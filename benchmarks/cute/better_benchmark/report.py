@@ -99,7 +99,14 @@ if __name__ == "__main__":
 
 from benchmarks.cute.better_benchmark import common
 
-IMPLS = ("inductor", "oracle", "helion_triton", "helion_cute", "memcopy")
+IMPLS = (
+    "inductor",
+    "oracle",
+    "helion_triton",
+    "helion_cute",
+    "inductor_helion_pretuned",
+    "memcopy",
+)
 PORTS = {"helion_cute": "cute", "helion_triton": "triton"}
 # T5's relative-position-bias backward, the selection's longest kernel under
 # Inductor by far: it dominates any time-weighted total.
@@ -242,6 +249,11 @@ def summarize(
         "inductor": min(ind) if ind else None,
         "oracle": impl_time(record, "oracle", metric),
         **{impl: impl_time(record, impl, metric, impl in elsewhere) for impl in PORTS},
+        # The pinned helion.inductor code (inductor_pretuned/), which pins its
+        # own configs: no autotune record of the run's applies to it.
+        "inductor_helion_pretuned": impl_time(
+            record, "inductor_helion_pretuned", metric
+        ),
         "memcopy": impl_time(record, "memcopy", metric),
     }
     cute = row["helion_cute"]
@@ -251,6 +263,10 @@ def summarize(
     triton = row["helion_triton"]
     row["triton_vs_inductor"] = (
         row["inductor"] / triton if row["inductor"] and triton else None
+    )
+    pinned = row["inductor_helion_pretuned"]
+    row["helion_inductor_vs_inductor"] = (
+        row["inductor"] / pinned if row["inductor"] and pinned else None
     )
     if cute and row["total_bytes"]:
         row["cute_gbps"] = row["total_bytes"] / cute / 1e3
@@ -268,6 +284,8 @@ def summarize(
             "oracle",
             "helion_triton",
             "helion_cute",
+            "inductor_helion_pretuned",
+            "inductor_helion",
         )
     }
     kernels = {}
@@ -345,6 +363,8 @@ def aggregate(
         ("triton_vs_inductor", "helion_triton", "inductor"),
         ("cute_vs_triton", "helion_cute", "helion_triton"),
         ("cute_vs_oracle", "helion_cute", "oracle"),
+        ("helion_inductor_vs_inductor", "inductor_helion_pretuned", "inductor"),
+        ("helion_inductor_vs_cute", "inductor_helion_pretuned", "helion_cute"),
     ):
         values = [v for row in rows if (v := ratio(row, impl, base)) is not None]
         out[key] = geomean(values)
@@ -553,6 +573,19 @@ def aggregate_lines(
         (
             "Helion+CuTe vs oracle, geomean (kernels)",
             lambda a: times(a["cute_vs_oracle"], a["cute_vs_oracle_kernels"]),
+        ),
+        (
+            "pinned helion.inductor vs Inductor, geomean (kernels)",
+            lambda a: times(
+                a["helion_inductor_vs_inductor"],
+                a["helion_inductor_vs_inductor_kernels"],
+            ),
+        ),
+        (
+            "pinned helion.inductor vs Helion+CuTe, geomean (kernels)",
+            lambda a: times(
+                a["helion_inductor_vs_cute"], a["helion_inductor_vs_cute_kernels"]
+            ),
         ),
     ]
     if any("rot_us" in a for a in columns.values()):
@@ -799,11 +832,12 @@ def main() -> None:
             "",
             (
                 "| repro | shape | MB | inductor | helion-cute | cute/ind"
-                f"{rot_column}{baseline_column} | helion-triton | triton/ind | oracle"
+                f"{rot_column}{baseline_column} | helion-triton | triton/ind"
+                " | helion.inductor | h.ind/ind | oracle"
                 " | memcopy | ind %SOL | cute %SOL | numerics"
                 " | left out of the aggregates |"
             ),
-            f"|{'---|' * (14 + bool(rot_column) + bool(baseline_column))}",
+            f"|{'---|' * (16 + bool(rot_column) + bool(baseline_column))}",
         ]
         for r in sorted(table, key=lambda r: r["cute_vs_inductor"] or 0):
             num = ",".join(f"{k.split('_')[-1]}={v}" for k, v in r["numerics"].items())
@@ -825,6 +859,8 @@ def main() -> None:
                 f" | {fmt(r['inductor'])} | {fmt(r['helion_cute'])}"
                 f" | {fmt(r['cute_vs_inductor'], '.3f')}{rot}{before}"
                 f" | {fmt(r['helion_triton'])} | {fmt(r['triton_vs_inductor'], '.3f')}"
+                f" | {fmt(r['inductor_helion_pretuned'])}"
+                f" | {fmt(r['helion_inductor_vs_inductor'], '.3f')}"
                 f" | {fmt(r['oracle'])} | {fmt(r['memcopy'])}"
                 f" | {fmt(100 * r['inductor_of_sol'] if r.get('inductor_of_sol') else None, '.0f')}"
                 f" | {fmt(100 * r['cute_of_sol'] if r.get('cute_of_sol') else None, '.0f')}"

@@ -13,6 +13,17 @@ Implementations (``--impls``):
   ``report.py`` tells the timing from one of a later autotune of the port.
   It names them before the port loads (``pinned_port``): an entry without
   them found no ok autotune record, whatever else failed
+- ``inductor_helion_pretuned``: helion.inductor's output code for the point
+  (``inductor_pretuned/<repro_id>.py``, written by ``inductor_pretuned.py``),
+  each Helion kernel pinned to the config a full autotune picked for it; the
+  record names the file, where its configs came from and whether its
+  helion.inductor is this tree's (``source_hash``, ``source_hash_matches``)
+- ``inductor_helion`` (only when named): ``torch.compile`` of the repro with
+  helion.inductor's backend (``common.inductor_helion_options()``), each Helion
+  kernel autotuned from scratch on its first call at HELION_AUTOTUNE_EFFORT
+  (full when unset; set HELION_FORCE_AUTOTUNE=1 to search past a warm Helion
+  cache); the record keeps the generated code and each kernel's search
+  (``output_code``, ``autotunes``)
 - ``memcopy``: better-benchmark's speed-of-light proxy, a copy of the repro's
   effective bytes (``byte_accounting.count_bytes_effective``)
 
@@ -103,12 +114,14 @@ from typing import Any
 from typing import Callable
 from typing import NamedTuple
 from typing import cast
+from unittest import mock
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from benchmarks.cute.better_benchmark import common
 import torch
+from torch._inductor.graph import GraphLowering
 from torch.profiler import ProfilerActivity
 from torch.profiler import profile
 
@@ -118,11 +131,21 @@ from helion.autotuner.benchmarking import _make_l2_cache_clearer
 from helion.autotuner.benchmarking import _positive_median
 from helion.autotuner.benchmarking import interleaved_bench
 from helion.autotuner.benchmarking import steady_graph_dispatch
+from helion.autotuner.metrics import register_post_autotune_hook
+from helion.autotuner.metrics import remove_post_autotune_hook
 
 # Judged by the gate against the default Inductor compile ("inductor"),
 # which the gate judges too: against itself, that fails only an output that
 # is not finite where the reference is (common._anchored_leaf).
-GATED_IMPLS = ("inductor", "inductor_cd", "oracle", "helion_triton", "helion_cute")
+GATED_IMPLS = (
+    "inductor",
+    "inductor_cd",
+    "oracle",
+    "helion_triton",
+    "helion_cute",
+    "inductor_helion_pretuned",
+    "inductor_helion",
+)
 
 # What the rounds of ``cold_us`` and of ``rot_us`` share. Untimed replays run
 # for ``SETTLE_S`` before the timed rounds: the GPU idles while the
@@ -223,6 +246,50 @@ def pinned_port(
     info["decorators"] = common.per_kernel(tuned["kernels"], "decorator")
     info.update(common.timed_record_fields(tuned))
     return common.load_port(repro_id, backend, pinned=info["decorators"]), tuned
+
+
+def cold_inductor_helion(
+    info: dict[str, Any],
+    repro_id: str,
+    shape: str,
+    instance: Any,
+    inputs: Callable[[], list[Any]],
+) -> Callable[[list[Any]], Any]:
+    """helion.inductor's compile of the repro, called once: Inductor generates
+    the Helion kernels and each autotunes on its first call. ``info`` gets
+    the compile options, the first call's wall time, the generated code and
+    each kernel's search. The code is caught as Inductor saves it, not with
+    run_and_get_code(), which resets dynamo, so the other implementations'
+    compiles stay (common.compile_inductor)."""
+    compiled = common.compile_inductor_helion(repro_id, shape, instance)
+    info["options"] = common.inductor_helion_options()
+    autotunes: list[dict[str, Any]] = []
+    codes: list[str] = []
+
+    def autotuned(metrics: Any) -> None:
+        autotunes.append(metrics.to_dict())
+
+    register_post_autotune_hook(autotuned)
+    started = time.monotonic()
+    try:
+        with (
+            mock.patch.object(GraphLowering, "save_output_code", codes.append),
+            torch.no_grad(),
+        ):
+            compiled(*inputs())
+        torch.cuda.synchronize()
+    finally:
+        remove_post_autotune_hook(autotuned)
+    info["first_call_s"] = round(time.monotonic() - started, 1)
+    code = "\n".join(codes)
+    info["helion_kernels"] = code.count("@helion.kernel(")
+    info["output_code"] = code
+    keys = ("kernel_name", "num_configs_tested", "autotune_time", "best_perf_ms")
+    info["autotunes"] = [
+        {**{k: a.get(k) for k in keys}, "config": a.get("selected_config")}
+        for a in autotunes
+    ]
+    return lambda inp: compiled(*inp)
 
 
 def do_bench(fn: Callable[[], object], **kwargs: object) -> object:
@@ -670,6 +737,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     call = lambda inp, c=compiled: c(*inp)  # noqa: E731
                 elif impl == "oracle":
                     call = common.load_oracle(args.repro_id, inputs())
+                elif impl == "inductor_helion_pretuned":
+                    info["pretuned_code"] = str(
+                        common.inductor_pretuned_path(args.repro_id)
+                    )
+                    pretuned = common.load_inductor_pretuned(args.repro_id, shape)
+                    info["configs_from"] = pretuned.CONFIGS_FROM
+                    # Whether the file holds this tree's helion.inductor code
+                    # (load_inductor_pretuned() warns when it does not).
+                    info["source_hash"] = pretuned.SOURCE_HASH
+                    info["source_hash_matches"] = (
+                        common.inductor_source_hash() == pretuned.SOURCE_HASH
+                    )
+                    call = pretuned.forward
+                elif impl == "inductor_helion":
+                    call = cold_inductor_helion(
+                        info, args.repro_id, shape, instance, inputs
+                    )
                 elif impl.startswith("helion_"):
                     port, tuned = pinned_port(
                         info,
@@ -776,7 +860,12 @@ def main() -> None:
     )
     parser.add_argument("--configs-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--impls", default=",".join(common.ALL_IMPLS))
+    parser.add_argument(
+        "--impls",
+        default=",".join(common.ALL_IMPLS),
+        help="comma-separated, of common.ALL_IMPLS (the default) and "
+        "common.OPT_IN_IMPLS",
+    )
     # Even round counts: as many rounds in each order (module docstring).
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--rep-ms", type=int, default=200)

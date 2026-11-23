@@ -52,6 +52,9 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_DIR = Path(__file__).resolve().parent
 KERNELS_DIR = PACKAGE_DIR / "kernels"
+# helion.inductor's output code for each selected point, its Helion kernels
+# pinned to tuned configs (inductor_pretuned.py writes them).
+INDUCTOR_PRETUNED_DIR = PACKAGE_DIR / "inductor_pretuned"
 SELECTION_PATH = PACKAGE_DIR / "selection.json"
 BB_ROOT = Path(
     os.environ.get("BETTER_BENCHMARK_ROOT", REPO_ROOT.parent / "better-benchmark")
@@ -112,15 +115,34 @@ def bench_record_path(bench_dir: Path, repro_id: str, shape: str) -> Path:
 
 # The implementations ``bench.py`` times, in the order of a forward round (its
 # ``--impls``). ``helion_<backend>`` is the Helion port pinned to that
-# backend's autotune record.
+# backend's autotune record; ``inductor_helion_pretuned`` is helion.inductor's
+# output code with its kernels pinned (``inductor_pretuned/``).
 ALL_IMPLS = (
     "inductor",
     "inductor_cd",
     "oracle",
     "helion_triton",
     "helion_cute",
+    "inductor_helion_pretuned",
     "memcopy",
 )
+# Timed only when ``--impls`` names it: helion.inductor compiled and its
+# kernels autotuned from scratch, on their first call.
+OPT_IN_IMPLS = ("inductor_helion",)
+
+
+# The backend of the pinned helion.inductor code in inductor_pretuned/, whose
+# decorators name it; inductor_pretuned.py writes no other into the directory.
+INDUCTOR_PRETUNED_BACKEND = "cute"
+
+
+def impl_backend(impl: str) -> str | None:
+    """The Helion backend whose code an implementation runs, the ports' and the
+    pinned helion.inductor code's (INDUCTOR_PRETUNED_BACKEND), or None for the
+    others."""
+    if impl.startswith("helion_"):
+        return impl.removeprefix("helion_")
+    return INDUCTOR_PRETUNED_BACKEND if impl == "inductor_helion_pretuned" else None
 
 
 def repro_dir(repro_id: str) -> Path:
@@ -225,6 +247,92 @@ def compile_inductor(
         compile_policy=compile_policy(repro_id, shape),
         **({"options": options} if options else {}),
     )
+
+
+def inductor_helion_options() -> dict[str, Any]:
+    """The ``torch.compile`` options of helion.inductor's implementations:
+    the backend's kernels on helion.inductor's backend (its config.backend:
+    CuTe under HELION_BACKEND=cute, else Triton), each autotuned on its first
+    call with the effort of HELION_AUTOTUNE_EFFORT (full when unset;
+    campaign.py sets it to full), and no device assert of an indirect index,
+    which a Helion kernel cannot emit (Inductor's check_bounds)."""
+    from helion.inductor import config as inductor_config
+
+    return {
+        "cuda_backend": "helion",
+        "helion.backend": inductor_config.backend,
+        "helion.autotune_effort": os.environ.get("HELION_AUTOTUNE_EFFORT") or "full",
+        "assert_indirect_indexing": False,
+    }
+
+
+def compile_inductor_helion(
+    repro_id: str, shape: str, instance: Any
+) -> Callable[..., Any]:
+    """``torch.compile`` of the repro as ``compile_inductor`` compiles it, with
+    helion.inductor's backend (``inductor_helion_options()``)."""
+    import helion.inductor  # noqa: F401  registers cuda_backend "helion"
+
+    bb_path()
+    import repro_harness  # pyrefly: ignore [missing-import]
+
+    return repro_harness.compile_repro(
+        instance,
+        compile_policy=compile_policy(repro_id, shape),
+        options=inductor_helion_options(),
+    )
+
+
+def inductor_pretuned_path(repro_id: str) -> Path:
+    return INDUCTOR_PRETUNED_DIR / f"{repro_id}.py"
+
+
+def load_inductor_pretuned(
+    repro_id: str, shape: str, path: Path | None = None
+) -> types.ModuleType:
+    """Import helion.inductor's pinned output code for ``repro_id`` (``path``,
+    by default ``inductor_pretuned/<repro_id>.py``), which was generated at
+    one shape point. Its module-level code loads the Helion kernels, whose
+    decorators each pin a config: under HELION_FORCE_AUTOTUNE=0, so that none
+    searches again in a process that forces autotuning (campaign.py's)."""
+    import helion
+
+    path = path or inductor_pretuned_path(repro_id)
+    if not path.exists():
+        raise FileNotFoundError(f"no pinned helion.inductor code at {path}")
+    name = f"_bb_inductor_pretuned_{repro_id}"
+    with env_override(HELION_FORCE_AUTOTUNE="0"):
+        spec = importlib.util.spec_from_file_location(name, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    if shape != module.SHAPE:
+        raise ValueError(
+            f"{path} was generated at shape {module.SHAPE}, not {shape}: "
+            "regenerate it with inductor_pretuned.py --shape"
+        )
+    for kernel_name, kernel in vars(module).items():
+        if isinstance(kernel, helion.Kernel) and (
+            len(kernel.configs) != 1 or kernel.settings.force_autotune
+        ):
+            raise RuntimeError(f"{path}: {kernel_name} is not pinned to one config")
+    if inductor_source_hash() != module.SOURCE_HASH:
+        warnings.warn(
+            f"{path} holds the code of another helion.inductor (source hash "
+            f"{module.SOURCE_HASH[:12]}, this tree's {inductor_source_hash()[:12]}): "
+            "it may not be the code helion.inductor generates now; regenerate it "
+            "with inductor_pretuned.py",
+            stacklevel=2,
+        )
+    return module
+
+
+def inductor_source_hash() -> str:
+    """The hash of helion.inductor's sources (its FX graph cache key's), which
+    a pinned file records as SOURCE_HASH."""
+    from helion.inductor import config as inductor_config
+
+    return inductor_config._source_hash
 
 
 def load_oracle(repro_id: str, inputs: list[Any]) -> Callable[[list[Any]], Any]:

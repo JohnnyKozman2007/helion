@@ -115,11 +115,12 @@ autotuning anything: it copies the autotune records of the selected points
 and ``--backends`` from DIR (that run's ``configs``) into this run's
 ``configs``, byte for byte, and runs the benches on them, so with a new
 ``--run-dir`` the records, logs and events land beside the earlier run and
-nothing of it changes. Of the Helion ports its benches time those of
+nothing of it changes. Of the Helion code its benches time that of
 ``--backends`` only, beside the other implementations (``bench.py --impls``
-without the other backends' ports; ``--bench-impls`` narrows the list
-further and may not name such a port): a bench pins no autotune record but
-those the option has made DIR's. With ``--rotate-inputs N`` the benches also
+without the other backends' ports, and without the pinned helion.inductor
+code, which is CuTe's, unless ``--backends`` has cute; ``--bench-impls``
+narrows the list further and may not name such an implementation): a bench
+pins no autotune record but those the option has made DIR's. With ``--rotate-inputs N`` the benches also
 time every implementation on N private input sets of its own (``bench.py``'s
 ``rot_us``); together they add that timing to a run's picks::
 
@@ -721,7 +722,7 @@ def main() -> None:
         "--bench-impls",
         default=None,
         help="the implementations the benches time (bench.py --impls; "
-        "default: all of them, with --configs-from the Helion ports of "
+        "default: all of them, with --configs-from the Helion code of "
         "--backends only)",
     )
     parser.add_argument(
@@ -793,16 +794,26 @@ def main() -> None:
     if args.configs_from is not None:
         if phases != {"bench"}:
             parser.error("--configs-from benches another run's picks: --phases bench")
-        # Its benches time the Helion ports of --backends only. A port of
+        # Its benches time the Helion code of --backends only. A port of
         # another backend would be pinned to whatever record of it the run
         # holds, which the option neither checks nor replaces: the copy an
         # earlier start made of another run's pick, say, timed beside the
-        # picks of this start's DIR.
-        ports = {f"helion_{backend}" for backend in backends}
+        # picks of this start's DIR. The pinned helion.inductor code is CuTe's.
+        timed = (None, *backends)
         given = [impl for impl in (bench_impls or "").split(",") if impl]
-        unselected = [
-            impl for impl in given if impl.startswith("helion_") and impl not in ports
-        ]
+        unselected = [impl for impl in given if common.impl_backend(impl) not in timed]
+        if "inductor_helion" in given:
+            parser.error(
+                "--configs-from benches without autotuning: --bench-impls names "
+                "inductor_helion, which autotunes helion.inductor's kernels from "
+                "scratch"
+            )
+        if "inductor_helion_pretuned" in unselected:
+            parser.error(
+                "--configs-from: --bench-impls names inductor_helion_pretuned, "
+                "the pinned helion.inductor code, which is CuTe's, and --backends "
+                f"{args.backends} has no cute"
+            )
         if unselected:
             parser.error(
                 f"--configs-from: --bench-impls names {', '.join(unselected)}, "
@@ -813,7 +824,7 @@ def main() -> None:
         bench_impls = ",".join(
             impl
             for impl in given or common.ALL_IMPLS
-            if not impl.startswith("helion_") or impl in ports
+            if common.impl_backend(impl) in timed
         )
         if not args.configs_from.is_dir():
             parser.error(f"--configs-from {args.configs_from}: no such directory")
