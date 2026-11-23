@@ -1792,13 +1792,16 @@ def _normalize_cute_vloop_sink(
 
 
 def cute_lone_row_reduction(
-    config_spec: ConfigSpec, *reduction_sequences: BlockIdSequence
+    config_spec: ConfigSpec,
+    *reduction_sequences: BlockIdSequence,
+    rollable: bool = False,
 ) -> tuple[int, int] | None:
     """``(row_block_id, reduction_block_id)`` of a kernel with no matmul, one
     tile axis (one block-size spec over one block) and one reduction that no
-    ``reduction_loops`` slot may roll, so it always runs persistent, when both
-    blocks have a ``num_threads`` entry and the reduction one in each of
-    ``reduction_sequences``; else None.
+    ``reduction_loops`` slot may roll, so it always runs persistent (with
+    ``rollable``: whose one unpinned slot may roll it or leave it persistent),
+    when both blocks have a ``num_threads`` entry and the reduction one in each
+    of ``reduction_sequences``; else None.
 
     Only the kernel's structure decides, never its extents: the knobs opened
     on it keep the search space (``structural_fingerprint``) the same across
@@ -1806,9 +1809,17 @@ def cute_lone_row_reduction(
     """
     if (
         config_spec.matmul_facts
-        or config_spec.reduction_loops
         or len(config_spec.block_sizes) != 1
         or len(config_spec.reduction_block_ids) != 1
+    ):
+        return None
+    if not rollable:
+        if config_spec.reduction_loops:
+            return None
+    elif len(config_spec.reduction_loops) != 1 or (
+        config_spec.reduction_loops[0].pinned
+        or list(config_spec.reduction_block_ids)
+        != [config_spec.reduction_loops[0].block_id]
     ):
         return None
     row_spec = config_spec.block_sizes[0]
@@ -1953,8 +1964,8 @@ def _cute_reduction_plans(
     miss its lanes, and the model does not know a resident reduction
     (``supports_resident_threads``): the emitter refuses an unpadded row in
     either place (``_unpadded_lanes``).  The search never meets the first,
-    as it opens ``cute_unpadded_rows`` only on a lone row
-    (``cute_lone_row_reduction``).
+    as it opens ``cute_unpadded_rows`` only on a lone row, persistent or
+    rollable (``cute_lone_row_reduction``).
     """
     nt_list = cast("list[int]", config.get("num_threads", []) or [])
     rl_list = cast("list[int | None]", config.get("reduction_loops", []) or [])
@@ -4128,10 +4139,20 @@ def cute_flat_fields(
             if (
                 cute_lone_row_reduction(config_spec, config_spec.cute_vector_widths)
                 is not None
+                or cute_lone_row_reduction(
+                    config_spec,
+                    config_spec.cute_reduction_reloads,
+                    config_spec.cute_vector_widths,
+                    rollable=True,
+                )
+                is not None
             ):
                 # Its seeds plant only where whole warps cover the row; the
                 # kernel's structure opens it, as for ``cute_lane_unroll``,
-                # so the search space is the same at every extent.
+                # so the search space is the same at every extent.  A row one
+                # ``reduction_loops`` slot may roll is seeded persistent too
+                # (``CutePersistentUnpaddedRowsHeuristic``), so its structure
+                # opens the knob as well.
                 fields["cute_unpadded_rows"] = EnumFragment(
                     (False, True), search_choices=(False, True)
                 )
